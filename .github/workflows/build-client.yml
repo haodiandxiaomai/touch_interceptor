@@ -1,0 +1,32 @@
+name: Build remote_touch client
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Compile remote_touch
+        run: |
+          aarch64-linux-gnu-gcc -static -o remote_touch remote/remote_touch.c -lm
+          file remote_touch
+          ls -la remote_touch
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-touch-client
+          path: remote_touch

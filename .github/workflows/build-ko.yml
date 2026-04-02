@@ -1,0 +1,198 @@
+name: Build touch_interceptor.ko
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      FORMATTED_BRANCH: "android14-6.1-2025-03"
+
+    steps:
+      # ============================================================
+      #  环境准备
+      # ============================================================
+      - name: Checkout 项目
+        uses: actions/checkout@v4
+        with:
+          path: touch_interceptor
+
+      - name: 清理磁盘空间
+        uses: endersonmenezes/free-disk-space@v3
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+          rm_cmd: "rmz"
+          rmz_version: "3.1.1"
+          testing: false
+
+      - name: 安装系统依赖
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves bc clang lld binutils-aarch64-linux-gnu
+          execute_install_scripts: true
+
+      - name: 下载 repo 工具
+        run: |
+          mkdir -p ~/bin
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod +x ~/bin/repo
+          echo "~/bin" >> $GITHUB_PATH
+
+      - name: 下载内核构建工具
+        run: |
+          git clone https://android.googlesource.com/kernel/prebuilts/build-tools -b main-kernel-build-2024 --depth 1 kernel-build-tools
+          git clone https://android.googlesource.com/platform/system/tools/mkbootimg -b main-kernel-build-2024 --depth 1 mkbootimg
+
+      - name: 配置 ccache
+        run: |
+          mkdir -p ~/.cache/bazel
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+
+      - name: ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: a14-6.1-128-ccache-v2
+          restore-keys: |
+            a14-6.1-128-ccache-
+
+      - name: Git 配置
+        run: |
+          git config --global user.name "BuildBot"
+          git config --global user.email "build@ci.local"
+
+      # ============================================================
+      #  同步内核源码 (android14-6.1-2025-03 = 6.1.128)
+      # ============================================================
+      - name: 同步内核源码
+        run: |
+          FB="${{ env.FORMATTED_BRANCH }}"
+          KR="$GITHUB_WORKSPACE/$FB"
+          mkdir -p "$KR"
+          cd "$KR"
+
+          echo "repo init: common-$FB"
+          repo init --depth=1 \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-$FB \
+            --repo-rev=v2.16
+
+          # 检查分支是否已弃用
+          RB=$(git ls-remote https://android.googlesource.com/kernel/common $FB 2>/dev/null || true)
+          if echo "$RB" | grep -q deprecated 2>/dev/null; then
+            echo "分支已弃用，切换到 deprecated 路径"
+            sed -i "s/\"$FB\"/\"deprecated\/$FB\"/g" .repo/manifests/default.xml
+          fi
+
+          echo "repo sync 开始..."
+          repo --trace sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
+
+          echo "KERNEL_ROOT=$KR" >> $GITHUB_ENV
+          echo "同步完成"
+
+      # ============================================================
+      #  Bazel 编译内核 + modules_prepare
+      # ============================================================
+      - name: 编译内核 (bazel)
+        run: |
+          cd $KERNEL_ROOT
+
+          tools/bazel build --disk_cache=$HOME/.cache/bazel --config=fast \
+            //common:kernel_aarch64 //common:kernel_aarch64_modules_prepare || exit 1
+
+          BAZEL_OUT=$(readlink -f bazel-bin/common/kernel_aarch64)
+          echo "=== 内核版本 ==="
+          strings "$BAZEL_OUT/Image" | grep 'Linux version' | head -1
+
+          echo "BAZEL_OUT=$BAZEL_OUT" >> $GITHUB_ENV
+
+      # ============================================================
+      #  解压 modules_prepare
+      # ============================================================
+      - name: 解压 modules_prepare
+        run: |
+          cd "$BAZEL_OUT"
+
+          MP_TGZ="../kernel_aarch64_modules_prepare/modules_prepare_outdir.tar.gz"
+          if [ ! -f "$MP_TGZ" ]; then
+            echo "ERROR: $MP_TGZ 不存在"
+            ls -la ../kernel_aarch64_modules_prepare/ || true
+            exit 1
+          fi
+
+          tar -xzf "$MP_TGZ"
+          echo "modules_prepare 解压完成"
+
+      # ============================================================
+      #  编译 touch_interceptor.ko
+      # ============================================================
+      - name: 编译 touch_interceptor.ko
+        run: |
+          DRIVER_SRC="$GITHUB_WORKSPACE/touch_interceptor/kernel"
+          KDIR="$KERNEL_ROOT/common"
+
+          # 确定 clang 路径
+          CLANG_DIR="$KERNEL_ROOT/prebuilts/clang/host/linux-x86/clang-r487747c"
+          if [ -x "$CLANG_DIR/bin/clang" ]; then
+            echo "使用 kernel prebuilts clang: $CLANG_DIR"
+          else
+            CLANG_DIR=$(find "$KERNEL_ROOT/prebuilts/clang" -name "clang" -type f 2>/dev/null | head -1 | xargs dirname 2>/dev/null | xargs dirname 2>/dev/null)
+            if [ -n "$CLANG_DIR" ] && [ -x "$CLANG_DIR/bin/clang" ]; then
+              echo "使用找到的 clang: $CLANG_DIR"
+            else
+              CLANG_DIR="/usr"
+              echo "使用系统 clang"
+            fi
+          fi
+
+          # 确定 CROSS_COMPILE 路径
+          CROSS="$KERNEL_ROOT/prebuilts/ndk-r23/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android-"
+          if [ ! -x "${CROSS}gcc" ]; then
+            CROSS="aarch64-linux-gnu-"
+            echo "CROSS_COMPILE fallback 到系统工具链"
+          fi
+
+          echo "=== 编译参数 ==="
+          echo "KDIR=$KDIR"
+          echo "O=$BAZEL_OUT"
+          echo "M=$DRIVER_SRC"
+          echo "clang: $($CLANG_DIR/bin/clang --version | head -1)"
+          echo "CROSS_COMPILE=$CROSS"
+
+          echo "=== 开始编译 ==="
+          env PATH="$CLANG_DIR/bin:$PATH" \
+            make -C "$KDIR" \
+              O="$BAZEL_OUT" \
+              M="$DRIVER_SRC" \
+              ARCH=arm64 \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              CROSS_COMPILE="$CROSS" \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              modules -j$(nproc)
+
+          echo "=== 编译结果 ==="
+          ls -la "$DRIVER_SRC/touch_interceptor.ko"
+          file "$DRIVER_SRC/touch_interceptor.ko"
+
+      # ============================================================
+      #  上传产物
+      # ============================================================
+      - name: 上传 touch_interceptor.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: touch_interceptor-6.1.128-ko
+          path: touch_interceptor/kernel/touch_interceptor.ko
