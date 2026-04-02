@@ -1,15 +1,12 @@
 /*
- * touch_interceptor v4 — 注入测试 (捕获后零开销)
+ * touch_interceptor v5 — 零 hook, 零开销
  *
- * 1. 注册一次性 kprobe → 第一个触摸事件时捕获设备指针 → 立即卸载 kprobe
- * 2. 注入通过 workqueue → input_event(real_dev)
- * 3. 零运行时开销 (无 hook，无 trap)
+ * 1. kprobe on kallsyms_lookup_name (触发1次 → 获取地址 → 卸载)
+ * 2. kallsyms_lookup_name("input_class") → class_find_device 遍历设备
+ * 3. 找到匹配名称的 input_dev
+ * 4. 注入通过 workqueue → input_event(real_dev)
  *
- * 用法:
- *   insmod touch_interceptor.ko
- *   touch 一下屏幕 (触发捕获)
- *   cat /proc/touch_interceptor (确认 real_dev 已捕获)
- *   remote_touch down 540 960
+ * 运行时零 hook 开销: 不拦截真实事件, 不 hook 任何热函数
  */
 
 #include <linux/module.h>
@@ -20,38 +17,83 @@
 #include <linux/proc_fs.h>
 #include <linux/workqueue.h>
 #include <linux/kprobes.h>
+#include <linux/device.h>
 
 #define MODULE_TAG  "touch_interceptor"
 #define PROC_NAME   "touch_interceptor"
+#define TARGET_NAME "NVTCapacitiveTouchScreen"
+
+/* ============ 参数 ============ */
+static char target_name[128] = TARGET_NAME;
+module_param_string(target, target_name, sizeof(target_name), 0644);
 
 /* ============ 状态 ============ */
 static struct input_dev *real_dev;
-static bool dev_captured;
 static u64 stat_injected;
 
-/* ============ 一次性 kprobe ============ */
+/* kallsyms_lookup_name 地址 (kprobe trick 获取) */
+typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
+static kallsyms_lookup_name_t my_kallsyms_lookup_name;
 
-static struct kprobe kp;
+/* ============ Step 1: 获取 kallsyms_lookup_name 地址 ============ */
 
-static int capture_handler(struct kprobe *p, struct pt_regs *regs)
+static struct kprobe kp_kallsyms;
+
+static int kp_kallsyms_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct input_dev *dev;
+	my_kallsyms_lookup_name = (kallsyms_lookup_name_t)p->addr;
+	return 0;
+}
 
-	if (dev_captured)
+/* ============ Step 2: 通过 input_class 找设备 ============ */
+
+struct find_ctx {
+	const char *name;
+	struct input_dev *found;
+};
+
+static int match_device(struct device *dev, void *data)
+{
+	struct find_ctx *ctx = data;
+	struct input_dev *idev;
+
+	/* input_dev 中嵌入的 device 是 dev->parent */
+	if (!dev->parent)
 		return 0;
 
-	dev = (struct input_dev *)regs->regs[0];
+	idev = container_of(dev->parent, struct input_dev, dev);
+	if (idev && idev->name && strcmp(idev->name, ctx->name) == 0) {
+		ctx->found = idev;
+		return 1; /* 找到了, 停止遍历 */
+	}
+	return 0;
+}
 
-	/* 通过特征匹配: 触摸屏有 ABS_MT_SLOT + INPUT_PROP_DIRECT */
-	if (dev && dev->name &&
-	    test_bit(ABS_MT_SLOT, dev->absbit) &&
-	    test_bit(INPUT_PROP_DIRECT, dev->propbit)) {
-		real_dev = dev;
-		dev_captured = true;
-		pr_info(MODULE_TAG ": captured %p (%s)\n", dev, dev->name);
-		unregister_kprobe(&kp);
+static int find_touchscreen(void)
+{
+	struct class *input_class;
+	struct find_ctx ctx = { .name = target_name, .found = NULL };
+
+	if (!my_kallsyms_lookup_name) {
+		pr_err(MODULE_TAG ": kallsyms_lookup_name not available\n");
+		return -ENODEV;
 	}
 
+	input_class = (struct class *)my_kallsyms_lookup_name("input_class");
+	if (!input_class) {
+		pr_err(MODULE_TAG ": input_class not found\n");
+		return -ENODEV;
+	}
+
+	class_find_device(input_class, NULL, &ctx, match_device);
+
+	if (!ctx.found) {
+		pr_err(MODULE_TAG ": device '%s' not found\n", target_name);
+		return -ENODEV;
+	}
+
+	real_dev = ctx.found;
+	pr_info(MODULE_TAG ": found %s at %p\n", real_dev->name, real_dev);
 	return 0;
 }
 
@@ -135,7 +177,7 @@ static void schedule_inject(struct touch_cmd *cmd)
 	struct inject_work *iw;
 
 	if (!real_dev) {
-		pr_warn(MODULE_TAG ": no device captured yet, touch screen first\n");
+		pr_warn(MODULE_TAG ": no device\n");
 		return;
 	}
 
@@ -168,10 +210,9 @@ static ssize_t proc_read(struct file *file, char __user *buf,
 	if (*ppos > 0) return 0;
 
 	len = snprintf(info, sizeof(info),
-		"real_dev: %p (%s)\ncaptured: %s\ninjected: %llu\n",
-		real_dev,
+		"target: %s\nreal_dev: %p (%s)\ninjected: %llu\n",
+		target_name, real_dev,
 		real_dev ? real_dev->name : "none",
-		dev_captured ? "yes" : "no",
 		stat_injected);
 
 	if (len > count) len = count;
@@ -191,30 +232,38 @@ static int __init touch_interceptor_init(void)
 {
 	int ret;
 
-	pr_info(MODULE_TAG ": loading v4\n");
+	pr_info(MODULE_TAG ": loading v5 (zero hook)\n");
 
+	/* Step 1: kprobe on kallsyms_lookup_name — 仅触发一次 */
+	kp_kallsyms.symbol_name = "kallsyms_lookup_name";
+	kp_kallsyms.pre_handler = kp_kallsyms_handler;
+
+	ret = register_kprobe(&kp_kallsyms);
+	if (ret) {
+		pr_err(MODULE_TAG ": kallsyms kprobe failed: %d\n", ret);
+		return ret;
+	}
+	unregister_kprobe(&kp_kallsyms);
+	pr_info(MODULE_TAG ": kallsyms_lookup_name = %p\n",
+		my_kallsyms_lookup_name);
+
+	/* Step 2: 通过 input_class 找设备 */
+	ret = find_touchscreen();
+	if (ret) {
+		pr_err(MODULE_TAG ": touchscreen not found\n");
+		return ret;
+	}
+
+	/* Step 3: 创建 proc */
 	if (!proc_create(PROC_NAME, 0666, NULL, &proc_fops))
 		return -ENOMEM;
 
-	/* 一次性 kprobe: 捕获后自动卸载，零运行时开销 */
-	kp.symbol_name = "input_handle_event";
-	kp.pre_handler = capture_handler;
-
-	ret = register_kprobe(&kp);
-	if (ret) {
-		pr_warn(MODULE_TAG ": kprobe failed: %d\n", ret);
-		pr_info(MODULE_TAG ": loaded without auto-capture\n");
-		pr_info(MODULE_TAG ": use: echo 'dev <name>' > /proc/touch_interceptor\n");
-	}
-
-	pr_info(MODULE_TAG ": loaded, touch screen to capture device\n");
+	pr_info(MODULE_TAG ": loaded v5, device: %s\n", real_dev->name);
 	return 0;
 }
 
 static void __exit touch_interceptor_exit(void)
 {
-	if (!dev_captured)
-		unregister_kprobe(&kp);
 	remove_proc_entry(PROC_NAME, NULL);
 	flush_scheduled_work();
 	pr_info(MODULE_TAG ": done, injected=%llu\n", stat_injected);
@@ -223,5 +272,5 @@ static void __exit touch_interceptor_exit(void)
 module_init(touch_interceptor_init);
 module_exit(touch_interceptor_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Touch interceptor v4 — zero-overhead injection");
+MODULE_DESCRIPTION("Touch interceptor v5 — zero hook overhead");
 MODULE_AUTHOR("interceptor");
