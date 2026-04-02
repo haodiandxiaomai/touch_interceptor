@@ -52,7 +52,7 @@ struct find_ctx {
 	struct input_dev *found;
 };
 
-static int match_device(struct device *dev, void *data)
+static int match_device(struct device *dev, const void *data)
 {
 	struct find_ctx *ctx = data;
 	struct input_dev *idev;
