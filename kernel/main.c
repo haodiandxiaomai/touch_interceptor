@@ -54,7 +54,7 @@ struct find_ctx {
 
 static int match_device(struct device *dev, const void *data)
 {
-	struct find_ctx *ctx = data;
+	struct find_ctx *ctx = (struct find_ctx *)data;
 	struct input_dev *idev;
 
 	/* input_dev 中嵌入的 device 是 dev->parent */
